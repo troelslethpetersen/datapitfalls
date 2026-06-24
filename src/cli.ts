@@ -3,6 +3,8 @@
 
 import { DOMAINS, TAGLINE, VERSION, ruleCount, ruleCountsByDomain } from './index.js';
 import { detectPitfalls } from './analyze.js';
+import { PROVIDER_DEFAULTS, inferProviderFromModel } from './providers/index.js';
+import type { ProviderName } from './providers/index.js';
 import { formatReport, hasBlockingFindings } from './report.js';
 import { buildScanInput, buildChainInput } from './scan-input.js';
 
@@ -200,40 +202,61 @@ function printHelp(): void {
       '  datapitfalls scan <file>         Scan a code file, analysis description, chart image, or PDF for pitfalls\n' +
       '  datapitfalls scan <a.png> <b.png> …  Scan several charts together (cross-chart pitfalls)\n' +
       '    --text                         Treat the file as a plain-English analysis description\n' +
-      '    --thorough                     Use Opus 4.7 instead of the default Sonnet 4.6\n' +
-      '    --fast                         Use Haiku 4.5 (cheapest)\n' +
+      '    --provider <name>              Which LLM provider to use: anthropic (default), openai, or gemini\n' +
+      '    --model <id>                   Override the model id (provider is inferred if not set)\n' +
+      '    --thorough                     Use the provider\'s deepest model (Opus 4.7 / GPT-5 / Gemini 2.5 Pro)\n' +
+      '    --fast                         Use the provider\'s cheapest model (Haiku 4.5 / GPT-5 mini / Gemini 2.5 Flash)\n' +
       '    --all                          Show all findings, incl. lower-confidence latent ones\n' +
       '    --summary                      Lead with an overall summary, consequence ratings, and avoided pitfalls\n' +
       '    --json                         Output the full report as JSON\n' +
       '    --ci                           Exit non-zero if an active error/warning is found\n' +
-      '\nImage files (.png/.jpg/.jpeg/.gif/.webp) are scanned with Claude Vision; pass several to\n' +
-      'scan them as a set. PDFs (.pdf) are read as native documents (prose + charts/tables), Word\n' +
-      'docs (.docx) as prose, slide decks (.pptx) as per-slide text + charts, and notebooks\n' +
-      '(.ipynb) as their extracted code.\n' +
-      '\nThe scan command needs an Anthropic API key in ANTHROPIC_API_KEY.\n' +
-      'Default model is claude-sonnet-4-6; override with --thorough, --fast, or ANTHROPIC_MODEL.\n' +
+      '\nImage files (.png/.jpg/.jpeg/.gif/.webp) are scanned with the provider\'s vision model;\n' +
+      'pass several to scan them as a set. PDFs (.pdf) are read as native documents (prose +\n' +
+      'charts/tables) by every provider, Word docs (.docx) as prose, slide decks (.pptx) as\n' +
+      'per-slide text + charts, and notebooks (.ipynb) as their extracted code.\n' +
+      '\nThe scan command needs an API key for the chosen provider:\n' +
+      '  anthropic → ANTHROPIC_API_KEY   (default)\n' +
+      '  openai    → OPENAI_API_KEY\n' +
+      '  gemini    → GOOGLE_API_KEY or GEMINI_API_KEY\n' +
+      'Model defaults are claude-sonnet-4-6 / gpt-5 / gemini-2.5-pro; override with --model or\n' +
+      'the ANTHROPIC_MODEL / OPENAI_MODEL / GEMINI_MODEL env vars.\n' +
       '\nThe splash adapts to your terminal background; force it with --theme <light|dark>\n' +
       'or the DATAPITFALLS_THEME env var.'
   );
 }
 
-const MODEL_FLAGS: Record<string, string> = {
-  '--thorough': 'claude-opus-4-7',
-  '--fast': 'claude-haiku-4-5',
-};
+const PROVIDERS: ProviderName[] = ['anthropic', 'openai', 'gemini'];
+
+function envKeyFor(provider: ProviderName): string[] {
+  switch (provider) {
+    case 'anthropic':
+      return ['ANTHROPIC_API_KEY'];
+    case 'openai':
+      return ['OPENAI_API_KEY'];
+    case 'gemini':
+      return ['GOOGLE_API_KEY', 'GEMINI_API_KEY'];
+  }
+}
 
 async function scan(args: string[]): Promise<void> {
-  const files = args.filter((arg) => !arg.startsWith('-'));
-  let model: string | undefined;
+  const files: string[] = [];
+  let modelOverride: string | undefined;
+  let providerOverride: ProviderName | undefined;
+  let speed: 'fast' | 'thorough' | undefined;
   let showAll = false;
   let asJson = false;
   let ci = false;
   let forceText = false;
   let chain = false;
   let summary = false;
-  for (const arg of args) {
-    if (arg in MODEL_FLAGS) {
-      model = MODEL_FLAGS[arg];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === undefined) continue;
+    if (arg === '--thorough') {
+      speed = 'thorough';
+    } else if (arg === '--fast') {
+      speed = 'fast';
     } else if (arg === '--all') {
       showAll = true;
     } else if (arg === '--summary') {
@@ -246,20 +269,55 @@ async function scan(args: string[]): Promise<void> {
       forceText = true;
     } else if (arg === '--chain') {
       chain = true;
+    } else if (arg === '--provider' || arg.startsWith('--provider=')) {
+      const value = arg === '--provider' ? args[++i] : arg.slice('--provider='.length);
+      if (!value || !(PROVIDERS as string[]).includes(value)) {
+        console.error(`--provider must be one of: ${PROVIDERS.join(', ')}`);
+        process.exitCode = 1;
+        return;
+      }
+      providerOverride = value as ProviderName;
+    } else if (arg === '--model' || arg.startsWith('--model=')) {
+      const value = arg === '--model' ? args[++i] : arg.slice('--model='.length);
+      if (!value) {
+        console.error('--model requires a model id (e.g. gpt-5, gemini-2.5-pro).');
+        process.exitCode = 1;
+        return;
+      }
+      modelOverride = value;
     } else if (arg.startsWith('-')) {
       console.error(`Unknown option: ${arg}`);
       process.exitCode = 1;
       return;
+    } else {
+      files.push(arg);
     }
   }
 
   if (files.length === 0) {
-    console.error('Usage: datapitfalls scan [--thorough|--fast] [--chain] <file> [more files…]');
+    console.error(
+      'Usage: datapitfalls scan [--provider anthropic|openai|gemini] [--model <id>] [--thorough|--fast] [--chain] <file> [more files…]'
+    );
     process.exitCode = 1;
     return;
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('ANTHROPIC_API_KEY is not set. Export your Anthropic API key to run a scan.');
+
+  // Resolve provider: explicit > inferred from model > default Anthropic.
+  const provider: ProviderName =
+    providerOverride ?? inferProviderFromModel(modelOverride) ?? 'anthropic';
+
+  // Resolve model: explicit --model > --fast/--thorough mapped to the provider's
+  // model family > provider default (engine picks it up if we leave undefined).
+  let model = modelOverride;
+  if (!model && speed) {
+    model = PROVIDER_DEFAULTS[provider][speed];
+  }
+
+  const keys = envKeyFor(provider);
+  if (!keys.some((k) => process.env[k])) {
+    console.error(
+      `${keys.join(' / ')} is not set. Export your ${provider} API key to run a scan.`
+    );
     process.exitCode = 1;
     return;
   }
@@ -272,7 +330,8 @@ async function scan(args: string[]): Promise<void> {
   }
 
   const report = await detectPitfalls(result.input, {
-    model,
+    provider,
+    ...(model ? { model } : {}),
     ...(summary ? { variant: 'summary' as const } : {}),
   });
   console.log(asJson ? JSON.stringify(report, null, 2) : formatReport(report, { showAll }));

@@ -39,9 +39,12 @@ pre-1.0, so per semver a **minor** bump (`0.x.0`) may contain a breaking change
 to the documented API — but every such change is called out in
 [`CHANGELOG.md`](../CHANGELOG.md). Patch releases never break the documented API.
 
-Everything in the engine requires an Anthropic API key (it calls the Claude
-API). Provide it via `options.apiKey`, a pre-built `options.client`, or the
-`ANTHROPIC_API_KEY` environment variable.
+Everything in the engine requires an LLM provider API key. By default
+datapitfalls uses Anthropic (Claude); pass `provider: 'openai'` or
+`'gemini'` to use OpenAI or Google Gemini instead. Provide the key via
+`options.apiKey`, a pre-built `options.client`, or the provider's standard
+environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+`GOOGLE_API_KEY` / `GEMINI_API_KEY`).
 
 ---
 
@@ -76,12 +79,19 @@ for (const f of report.findings) {
 
 ```ts
 interface DetectionOptions {
-  /** Model id. Defaults to ANTHROPIC_MODEL, then claude-sonnet-4-6. */
+  /** Which LLM provider to use: 'anthropic' (default), 'openai', or 'gemini'.
+   *  Inferred from an injected `client` or the `model` id when omitted. */
+  provider?: 'anthropic' | 'openai' | 'gemini';
+  /** Model id. Per-provider defaults: claude-sonnet-4-6 / gpt-5 / gemini-2.5-pro.
+   *  May also be set via ANTHROPIC_MODEL / OPENAI_MODEL / GEMINI_MODEL. */
   model?: string;
-  /** API key. Defaults to the ANTHROPIC_API_KEY environment variable. */
+  /** API key. Defaults to the provider's standard env var:
+   *  ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY / GEMINI_API_KEY. */
   apiKey?: string;
-  /** Pre-constructed Anthropic client (overrides apiKey). */
-  client?: Anthropic;
+  /** Pre-constructed SDK client (Anthropic, OpenAI, or @google/genai
+   *  GoogleGenAI). Overrides `apiKey` and, if `provider` is not given, also
+   *  determines which provider is used. */
+  client?: unknown;
   /** Restrict grounding to these domains. Defaults to the whole catalog. */
   domains?: Domain[];
   /** Max output tokens. Defaults to 16000. */
@@ -92,6 +102,14 @@ interface DetectionOptions {
   variant?: PresentationVariant;
 }
 ```
+
+Every provider receives the same neutral request internally (text / images /
+native PDF / forced tool call), and applies its own caching mechanism to the
+catalog block: Anthropic uses `cache_control: ephemeral`, OpenAI relies on
+automatic prefix caching (with a stable `prompt_cache_key`), and Gemini
+creates an explicit `cachedContent` resource (TTL ~5 min, in-process LRU,
+with a transparent fallback to inlining the catalog if cache creation
+fails).
 
 ---
 

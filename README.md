@@ -140,11 +140,22 @@ npm install datapitfalls
 npx datapitfalls scan ./my-chart.png
 ```
 
-You'll need a Claude API key from [Anthropic](https://console.anthropic.com/). Set it in your environment:
+You'll need an API key for the LLM provider you want to use. By default datapitfalls uses [Anthropic Claude](https://console.anthropic.com/); it also supports [OpenAI](https://platform.openai.com/) and [Google Gemini](https://aistudio.google.com/). Set the corresponding key in your environment:
 
 ```bash
+# default — Anthropic
 export ANTHROPIC_API_KEY="sk-ant-..."
+
+# or use OpenAI
+export OPENAI_API_KEY="sk-..."
+datapitfalls scan --provider openai ./my-chart.png
+
+# or use Google Gemini
+export GOOGLE_API_KEY="..."
+datapitfalls scan --provider gemini ./my-chart.png
 ```
+
+PDFs are sent natively to every provider (so the model reviews the prose *and* the charts and tables on each page), and the pitfall catalog is cached via each provider's caching mechanism so repeated scans only pay full price for the per-request artifact.
 
 > datapitfalls requires Node.js **18 or later**.
 

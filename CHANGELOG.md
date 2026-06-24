@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Multi-provider support. `detectPitfalls()` now works against three LLM
+  providers: Anthropic (the default; unchanged behavior), OpenAI (Responses
+  API), and Google Gemini (`@google/genai`). Select via
+  `options.provider`, an injected `options.client` (Anthropic / OpenAI /
+  GoogleGenAI), or by passing a `gpt-*` / `gemini-*` / `claude-*` model id.
+  PDFs are sent natively to every provider (no local text extraction); the
+  pitfall catalog block is cached via each provider's caching mechanism —
+  Anthropic ephemeral `cache_control`, OpenAI automatic prefix caching with
+  a stable `prompt_cache_key`, Gemini explicit `cachedContent` (in-process
+  LRU, ~5 min TTL, with a transparent fallback to inlining the catalog if
+  cache creation fails). The CLI grows `--provider <name>` and `--model
+  <id>`; `--fast` / `--thorough` now map to each provider's cheapest /
+  deepest model. API keys for the new providers come from `OPENAI_API_KEY`
+  and `GOOGLE_API_KEY` / `GEMINI_API_KEY`; models can be overridden via
+  `OPENAI_MODEL` / `GEMINI_MODEL`.
+
 ## [0.6.0] - 2026-06-12
 
 ### Added

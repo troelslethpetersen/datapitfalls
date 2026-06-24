@@ -8,16 +8,23 @@ treat anything here as sacred.
 ## What this is
 
 datapitfalls detects data pitfalls in data work (charts, code, prose, documents) against
-a taxonomy of data pitfalls, powered by the Claude API. Three parts:
+a taxonomy of data pitfalls, powered by an LLM (Anthropic Claude by default; also
+OpenAI and Google Gemini). Three parts:
 
 - **Engine** (`src/`) — `detectPitfalls()` scans code, text, one or several chart images
   (cross-chart detection), and PDFs (native document). The taxonomy lives as YAML in
   `src/taxonomy/<domain>/` (with `extensions/` subfolders); `npm run build`
-  regenerates `src/taxonomy/data.ts` and `npm run validate` checks the rules.
-- **CLI** — `datapitfalls scan`; file routing in `src/scan-input.ts`.
+  regenerates `src/taxonomy/data.ts` and `npm run validate` checks the rules. Provider
+  adapters live in `src/providers/`; the engine builds one neutral request and the
+  chosen provider translates it to its SDK (forced tool/function call, native PDFs,
+  per-provider caching of the catalog block).
+- **CLI** — `datapitfalls scan`; file routing in `src/scan-input.ts`. `--provider`
+  selects the LLM, `--model` overrides the model id, and `--fast` / `--thorough` map
+  to each provider's cheapest / deepest model.
 - **Web app** (`web/`, Next.js, an npm workspace) — the same inputs in the browser;
   API route at `web/app/api/audit/route.ts`. Deployed on Vercel with a server-side
-  `ANTHROPIC_API_KEY`.
+  `ANTHROPIC_API_KEY` (the web app is Anthropic-only today; the engine itself is
+  multi-provider).
 
 ## Branch naming
 
