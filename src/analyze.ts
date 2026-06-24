@@ -5,9 +5,21 @@
 // structured findings via a forced tool call. Rule ids in the model's output are
 // validated against the catalog, so a finding can only ever reference a real rule.
 
-import Anthropic from '@anthropic-ai/sdk';
+import { createHash } from 'node:crypto';
 import { getAllRules, getRule, getRulesByDomain } from './taxonomy/index.js';
 import type { Domain, PitfallRule, Severity } from './taxonomy/index.js';
+import {
+  PROVIDER_DEFAULTS,
+  inferProviderFromModel,
+  pickProvider,
+} from './providers/index.js';
+import type {
+  NeutralContentPart,
+  NeutralRequest,
+  NeutralSystemBlock,
+  NeutralTool,
+  ProviderName,
+} from './providers/index.js';
 
 /** The kind of artifact being audited. */
 export type InputKind = 'code' | 'text' | 'image' | 'document' | 'slides' | 'chain';
@@ -194,12 +206,19 @@ export interface PitfallReport {
 }
 
 export interface DetectionOptions {
-  /** Model id. Defaults to ANTHROPIC_MODEL, then claude-sonnet-4-6. */
+  /** Model id. Defaults vary by provider; see PROVIDER_DEFAULTS. May also be
+   *  set via the ANTHROPIC_MODEL / OPENAI_MODEL / GEMINI_MODEL env vars. */
   model?: string;
-  /** API key. Defaults to the ANTHROPIC_API_KEY environment variable. */
+  /** Which LLM provider to use. Inferred from `client` or the model id when
+   *  omitted; falls back to 'anthropic'. */
+  provider?: ProviderName;
+  /** API key. Defaults to the provider's standard env var
+   *  (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY). */
   apiKey?: string;
-  /** Pre-constructed Anthropic client (overrides apiKey). */
-  client?: Anthropic;
+  /** Pre-constructed SDK client (Anthropic / OpenAI / GoogleGenAI). Used by
+   *  tests and advanced callers; overrides apiKey. Its type implies the
+   *  provider when `provider` is not given. */
+  client?: unknown;
   /** Restrict grounding to these domains. Defaults to the whole catalog. */
   domains?: Domain[];
   /** Max output tokens. Defaults to 16000. */
@@ -209,10 +228,11 @@ export interface DetectionOptions {
   variant?: PresentationVariant;
 }
 
-// claude-sonnet-4-6 is the default: in the eval harness it had the highest active
-// precision and best calibration of the three models, at ~half the cost of Opus 4.7
-// (Opus, --thorough; Haiku 4.5, --fast).
-export const DEFAULT_MODEL = 'claude-sonnet-4-6';
+// claude-sonnet-4-6 is the default Anthropic model: in the eval harness it had
+// the highest active precision and best calibration of the three Claude models
+// tested, at ~half the cost of Opus 4.7. Per-provider defaults live in
+// providers/index.ts so each can pick a sensible "everyday" model.
+export const DEFAULT_MODEL = PROVIDER_DEFAULTS.anthropic.default;
 
 const SYSTEM_INSTRUCTIONS = `You are datapitfalls, a pitfall detector that reviews data work for known data pitfalls.
 
@@ -290,10 +310,10 @@ Rules of engagement:
 
 Return your results by calling the report_findings tool.`;
 
-const REPORT_TOOL: Anthropic.Tool = {
+const REPORT_TOOL: NeutralTool = {
   name: 'report_findings',
   description: 'Report the data pitfalls found in the artifact.',
-  input_schema: {
+  jsonSchema: {
     type: 'object',
     properties: {
       findings: {
@@ -358,10 +378,14 @@ function variantAddendum(variant: PresentationVariant): string {
 
 // EXPERIMENTAL — the report tool with the variant's extra fields. Baseline
 // returns REPORT_TOOL untouched so the shipped request is byte-identical.
-function buildReportTool(variant: PresentationVariant): Anthropic.Tool {
+function buildReportTool(variant: PresentationVariant): NeutralTool {
   if (variant === 'baseline') return REPORT_TOOL;
-  const tool = structuredClone(REPORT_TOOL);
-  const schema = tool.input_schema as unknown as {
+  const tool: NeutralTool = {
+    name: REPORT_TOOL.name,
+    description: REPORT_TOOL.description,
+    jsonSchema: structuredClone(REPORT_TOOL.jsonSchema),
+  };
+  const schema = tool.jsonSchema as unknown as {
     properties: Record<string, unknown>;
     required: string[];
   };
@@ -450,32 +474,42 @@ function selectRules(input: DetectionInput, domains?: Domain[]): PitfallRule[] {
   return [...getAllRules()];
 }
 
-// The content blocks for a single artifact, without any call-to-action — used to
+// The content parts for a single artifact, without any call-to-action — used to
 // lay out each stage of a chain. (The standalone single-artifact branches below
 // keep their own tuned framing.)
-function rawArtifactBlocks(input: SingleArtifactInput): Anthropic.ContentBlockParam[] {
+function rawArtifactBlocks(input: SingleArtifactInput): NeutralContentPart[] {
   if (input.kind === 'image') {
     const multiple = input.images.length > 1;
-    const blocks: Anthropic.ContentBlockParam[] = [];
+    const blocks: NeutralContentPart[] = [];
     input.images.forEach((img, i) => {
       if (multiple) {
         const where = img.filename ? ` — ${img.filename}` : '';
         blocks.push({ type: 'text', text: `Chart ${i + 1}${where}:` });
       }
-      blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.content } });
+      blocks.push({
+        type: 'image',
+        mediaType: img.mediaType,
+        base64: img.content,
+        filename: img.filename,
+      });
     });
     return blocks;
   }
   if (input.kind === 'document') {
-    return [{ type: 'document', source: { type: 'base64', media_type: input.mediaType, data: input.content } }];
+    return [{ type: 'document_pdf', base64: input.content, filename: input.filename }];
   }
   if (input.kind === 'slides') {
-    const blocks: Anthropic.ContentBlockParam[] = [];
+    const blocks: NeutralContentPart[] = [];
     input.slides.forEach((slide, i) => {
       const text = slide.text.trim();
       blocks.push({ type: 'text', text: `Slide ${i + 1}:${text ? `\n${text}` : ' (no text)'}` });
       for (const img of slide.images) {
-        blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.content } });
+        blocks.push({
+          type: 'image',
+          mediaType: img.mediaType,
+          base64: img.content,
+          filename: img.filename,
+        });
       }
     });
     return blocks;
@@ -483,9 +517,9 @@ function rawArtifactBlocks(input: SingleArtifactInput): Anthropic.ContentBlockPa
   return [{ type: 'text', text: `<artifact>\n${input.content}\n</artifact>` }];
 }
 
-function buildUserContent(input: DetectionInput): Anthropic.MessageParam['content'] {
+function buildUserContent(input: DetectionInput): NeutralContentPart[] {
   if (input.kind === 'chain') {
-    const content: Anthropic.ContentBlockParam[] = [
+    const content: NeutralContentPart[] = [
       {
         type: 'text',
         text:
@@ -507,7 +541,7 @@ function buildUserContent(input: DetectionInput): Anthropic.MessageParam['conten
   if (input.kind === 'image') {
     const images = input.images;
     const multiple = images.length > 1;
-    const content: Anthropic.ContentBlockParam[] = [];
+    const content: NeutralContentPart[] = [];
     images.forEach((img, i) => {
       if (multiple) {
         const where = img.filename ? ` — ${img.filename}` : '';
@@ -515,7 +549,9 @@ function buildUserContent(input: DetectionInput): Anthropic.MessageParam['conten
       }
       content.push({
         type: 'image',
-        source: { type: 'base64', media_type: img.mediaType, data: img.content },
+        mediaType: img.mediaType,
+        base64: img.content,
+        filename: img.filename,
       });
     });
     content.push({
@@ -536,10 +572,7 @@ function buildUserContent(input: DetectionInput): Anthropic.MessageParam['conten
   if (input.kind === 'document') {
     const where = input.filename ? ` (${input.filename})` : '';
     return [
-      {
-        type: 'document',
-        source: { type: 'base64', media_type: input.mediaType, data: input.content },
-      },
+      { type: 'document_pdf', base64: input.content, filename: input.filename },
       {
         type: 'text',
         text:
@@ -551,7 +584,7 @@ function buildUserContent(input: DetectionInput): Anthropic.MessageParam['conten
   }
   if (input.kind === 'slides') {
     const where = input.filename ? ` (${input.filename})` : '';
-    const content: Anthropic.ContentBlockParam[] = [
+    const content: NeutralContentPart[] = [
       {
         type: 'text',
         text:
@@ -567,16 +600,22 @@ function buildUserContent(input: DetectionInput): Anthropic.MessageParam['conten
       for (const img of slide.images) {
         content.push({
           type: 'image',
-          source: { type: 'base64', media_type: img.mediaType, data: img.content },
+          mediaType: img.mediaType,
+          base64: img.content,
+          filename: img.filename,
         });
       }
     });
     return content;
   }
-  return (
-    `Review the following ${describeInput(input)} for data pitfalls from the catalog.\n\n` +
-    `<artifact>\n${input.content}\n</artifact>`
-  );
+  return [
+    {
+      type: 'text',
+      text:
+        `Review the following ${describeInput(input)} for data pitfalls from the catalog.\n\n` +
+        `<artifact>\n${input.content}\n</artifact>`,
+    },
+  ];
 }
 
 function normalizeConfidence(value: unknown): Confidence {
@@ -591,16 +630,6 @@ function normalizeConsequence(value: unknown): Consequence | undefined {
   return value === 'changes-takeaway' || value === 'weakens-support' || value === 'polish'
     ? value
     : undefined;
-}
-
-/** The raw input of the report_findings tool call, or undefined if absent. */
-function findToolInput(message: Anthropic.Message): Record<string, unknown> | undefined {
-  const toolUse = message.content.find(
-    (block): block is Anthropic.ToolUseBlock =>
-      block.type === 'tool_use' && block.name === REPORT_TOOL.name
-  );
-  if (!toolUse || typeof toolUse.input !== 'object' || toolUse.input === null) return undefined;
-  return toolUse.input as Record<string, unknown>;
 }
 
 /** A trimmed, non-empty string from the tool input, or undefined. */
@@ -670,11 +699,44 @@ function extractAvoided(
   return avoided;
 }
 
+/** Stable cache key for the provider's caching mechanism, derived from
+ *  everything that defines the cacheable prefix: catalog text, tool schema,
+ *  model, variant. Changing any of these intentionally invalidates the cache. */
+function cacheKeyFor(taxonomyBlock: string, tool: NeutralTool, model: string, variant: PresentationVariant): string {
+  const hash = createHash('sha256');
+  hash.update(variant);
+  hash.update('\0');
+  hash.update(model);
+  hash.update('\0');
+  hash.update(tool.name);
+  hash.update('\0');
+  hash.update(JSON.stringify(tool.jsonSchema));
+  hash.update('\0');
+  hash.update(taxonomyBlock);
+  return `datapitfalls-${hash.digest('hex').slice(0, 32)}`;
+}
+
+function envModelFor(provider: ProviderName): string | undefined {
+  switch (provider) {
+    case 'anthropic':
+      return process.env.ANTHROPIC_MODEL;
+    case 'openai':
+      return process.env.OPENAI_MODEL;
+    case 'gemini':
+      return process.env.GEMINI_MODEL ?? process.env.GOOGLE_MODEL;
+  }
+}
+
 /**
  * Detect the data pitfalls an artifact exhibits, against the pitfall catalog.
  *
- * Requires an Anthropic API key (via options.apiKey, options.client, or the
- * ANTHROPIC_API_KEY environment variable).
+ * Requires an LLM provider API key. By default Anthropic
+ * (`ANTHROPIC_API_KEY`); pass `provider: 'openai'` or `'gemini'` (or use a
+ * `gpt-*` / `gemini-*` model id) to use OpenAI (`OPENAI_API_KEY`) or Google
+ * Gemini (`GOOGLE_API_KEY` / `GEMINI_API_KEY`) instead. PDFs are sent
+ * natively to each provider; the catalog block is cached via each
+ * provider's caching mechanism (Anthropic ephemeral, OpenAI automatic
+ * prefix, Gemini explicit cachedContent).
  */
 export async function detectPitfalls(
   input: DetectionInput,
@@ -682,10 +744,16 @@ export async function detectPitfalls(
 ): Promise<PitfallReport> {
   const rules = selectRules(input, options.domains);
 
-  const model = options.model ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL;
+  // Pick the provider first, because the model default depends on it.
+  const providerName: ProviderName =
+    options.provider ??
+    inferProviderFromModel(options.model) ??
+    inferProviderFromInjectedClient(options.client) ??
+    'anthropic';
+  const model =
+    options.model ?? envModelFor(providerName) ?? PROVIDER_DEFAULTS[providerName].default;
   const maxTokens = options.maxTokens ?? 16000;
   const variant = options.variant ?? 'baseline';
-  const client = options.client ?? new Anthropic(options.apiKey ? { apiKey: options.apiKey } : {});
 
   const instructions =
     input.kind === 'image'
@@ -698,37 +766,59 @@ export async function detectPitfalls(
   const taxonomyBlock = `# Pitfall catalog (${rules.length} rules)\n\n${serializeRules(rules)}`;
   const reportTool = buildReportTool(variant);
 
-  const message = await client.messages.create({
+  const system: NeutralSystemBlock[] = [
+    { text: instructions + variantAddendum(variant) },
+    // The catalog is identical across requests of the same kind — mark it
+    // cacheable so each provider can apply its caching mechanism (Anthropic
+    // ephemeral block, Gemini explicit cachedContent, OpenAI prefix cache).
+    { text: taxonomyBlock, cacheable: true },
+  ];
+
+  const request: NeutralRequest = {
     model,
-    max_tokens: maxTokens,
-    system: [
-      { type: 'text', text: instructions + variantAddendum(variant) },
-      // The catalog is identical across requests of the same kind — cache it so
-      // repeated audits only pay full price for the (small) per-request artifact.
-      { type: 'text', text: taxonomyBlock, cache_control: { type: 'ephemeral' } },
-    ],
-    tools: [reportTool],
-    tool_choice: { type: 'tool', name: reportTool.name },
-    messages: [{ role: 'user', content: buildUserContent(input) }],
+    maxTokens,
+    system,
+    userContent: buildUserContent(input),
+    tool: reportTool,
+    cacheKey: cacheKeyFor(taxonomyBlock, reportTool, model, variant),
+  };
+
+  const provider = pickProvider({
+    provider: providerName,
+    client: options.client,
+    apiKey: options.apiKey,
+    model,
   });
 
-  const toolInput = findToolInput(message);
+  const response = await provider.detect(request);
+  const toolInput = response.toolInput;
   const findings = extractFindings(toolInput);
 
   return {
     findings,
     kind: input.kind,
-    model,
+    model: response.model,
     rulesConsidered: rules.length,
     summary: variant === 'summary' ? nonEmptyString(toolInput?.summary) : undefined,
     avoided: variant === 'summary' ? extractAvoided(toolInput, findings) : undefined,
-    usage: message.usage
-      ? {
-          inputTokens: message.usage.input_tokens,
-          outputTokens: message.usage.output_tokens,
-          cacheReadInputTokens: message.usage.cache_read_input_tokens ?? 0,
-          cacheCreationInputTokens: message.usage.cache_creation_input_tokens ?? 0,
-        }
-      : undefined,
+    usage: response.usage,
   };
+}
+
+/** Same duck-typed detection as in providers/index.ts, but only the part
+ *  detectPitfalls() needs (to pick the right default model). Keeps the engine
+ *  from circular-importing the full pickProvider helper. */
+function inferProviderFromInjectedClient(client: unknown): ProviderName | undefined {
+  if (!client || typeof client !== 'object') return undefined;
+  const c = client as Record<string, unknown>;
+  if (c.messages && typeof (c.messages as { create?: unknown }).create === 'function') {
+    return 'anthropic';
+  }
+  if (c.responses && typeof (c.responses as { create?: unknown }).create === 'function') {
+    return 'openai';
+  }
+  if (c.models && typeof (c.models as { generateContent?: unknown }).generateContent === 'function') {
+    return 'gemini';
+  }
+  return undefined;
 }
